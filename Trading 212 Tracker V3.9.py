@@ -1,19 +1,21 @@
+# Trading212 Portfolio Pro — v4.3 (Net Gain History Chart + persistent JSON tracking + hover tooltips FIXED)
+# Updated: Expanded time range filters → 1hr,4hr,8hr,16hr,24hr,1d,1w,1m,3m,YTD,1Y,All Time
 # ------------------------------------------------------------
-# Features & fixes summary (v4.3 additions marked):
+# Features & fixes summary:
 # • Live positions & cash from Trading212 Public API
 # • Accurate total return using imported CSV transactions
 # • Rate-limit handling (429) with auto-retry + live cooldown countdown
 # • Enhanced dashboard: color-coded Total Return, cash %, session change arrow
 # • Warnings: stale data (>10 min), high concentration (>25% in one position)
-# • Matplotlib toolbar removed for clean look
 # • Charts polished: larger size, no top/right spines, subtle grid
 # • Tiny negative P/L (e.g. -0.01) forced to 0.00 via threshold + rounding
 # • Yellow countdown timer in sidebar showing seconds until next auto-refresh
 # • Sidebar "Net Gain £" tile shows same £ value as Total Return card
 # • Net Gain £ tile turns light green (+) or light red (-)
-# • [NEW] Net Gain History tab with time-series chart
-# • [NEW] Saves net gain + total assets history to JSON on each refresh
-# • Removed: Analyst tab and Debug API button/function (codebase cleanup)
+# • Net Gain History tab with time-series chart + persistent JSON tracking
+# • Hover tooltips on net gain points showing date & value
+# • FIXED: tooltips no longer persist after mouse leave or chart refresh
+# • NEW: Time range buttons: 1hr, 4hr, 8hr, 16hr, 24hr, 1d, 1w, 1m, 3m, YTD, 1Y, All Time
 # ------------------------------------------------------------
 import os
 import json
@@ -40,9 +42,17 @@ try:
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
     import matplotlib.dates as mdates
+    import matplotlib.text as mtext
+    import numpy as np
     MATPLOTLIB = True
 except ImportError:
     MATPLOTLIB = False
+try:
+    import mplcursors
+    MPLCURSORS_AVAILABLE = True
+except ImportError:
+    MPLCURSORS_AVAILABLE = False
+    print("Note: mplcursors not installed → hover tooltips disabled. Install with: pip install mplcursors")
 
 # ────────────────────────────────────────────────
 # CONFIG
@@ -55,7 +65,6 @@ SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 MIN_MAX_FILE = os.path.join(DATA_DIR, "min_max.json")
 NET_GAIN_HISTORY_FILE = os.path.join(DATA_DIR, "net_gain_history.json")
 BASE_URL = "https://live.trading212.com/api/v0"
-
 CACHE_TTL = 30
 MAX_BAR_TICKERS = 25
 STALE_THRESHOLD_MIN = 10
@@ -63,7 +72,6 @@ CONCENTRATION_THRESHOLD_PCT = 25
 ZERO_PL_THRESHOLD = 0.05
 HISTORY_MAX_POINTS = 500
 HISTORY_PLOT_DAYS = 90
-
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ────────────────────────────────────────────────
@@ -228,7 +236,6 @@ class Trading212Service:
         total_value = 0.0
         zero_pl_count = 0
         fallback_used = 0
-
         for pos in items:
             try:
                 instr = pos.get('instrument', {})
@@ -373,7 +380,6 @@ class Trading212App:
         self.df = self.repo.load()
         self.creds = Secrets.load()
         self.service = Trading212Service(self.creds)
-
         self.positions: List[Position] = []
         self.cash_balance: float = 0.0
         self.last_refresh_str = "Never"
@@ -384,8 +390,12 @@ class Trading212App:
         self.countdown_after_id = None
         self.next_auto_refresh_time = 0.0
 
+        # Net Gain chart period selector — changed default to 1d
+        self.netgain_period_var = tk.StringVar(value="1d")
+
         self._setup_style()
         self._build_ui()
+
         self.refresh(async_fetch=True)
         self.update_countdown()
 
@@ -406,16 +416,17 @@ class Trading212App:
     def _build_ui(self):
         self.sidebar = ttk.Frame(self.root, width=220)
         self.sidebar.pack(side=LEFT, fill=Y, padx=(10, 0), pady=10)
+
         self.content = ttk.Frame(self.root)
         self.content.pack(side=LEFT, fill=BOTH, expand=True, padx=10, pady=10)
 
         self.tabs = {}
-        self.tab_dashboard    = ttk.Frame(self.content); self.tabs["Dashboard"]          = self.tab_dashboard
-        self.tab_netgain      = ttk.Frame(self.content); self.tabs["Net Gain History"]   = self.tab_netgain
-        self.tab_transactions = ttk.Frame(self.content); self.tabs["Transactions"]       = self.tab_transactions
-        self.tab_positions    = ttk.Frame(self.content); self.tabs["Positions"]          = self.tab_positions
-        self.tab_minmax       = ttk.Frame(self.content); self.tabs["Historical Highs & Lows"] = self.tab_minmax
-        self.tab_settings     = ttk.Frame(self.content); self.tabs["Settings"]           = self.tab_settings
+        self.tab_dashboard = ttk.Frame(self.content);     self.tabs["Dashboard"] = self.tab_dashboard
+        self.tab_netgain   = ttk.Frame(self.content);     self.tabs["Net Gain History"] = self.tab_netgain
+        self.tab_transactions = ttk.Frame(self.content);  self.tabs["Transactions"] = self.tab_transactions
+        self.tab_positions = ttk.Frame(self.content);     self.tabs["Positions"] = self.tab_positions
+        self.tab_minmax    = ttk.Frame(self.content);     self.tabs["Historical Highs & Lows"] = self.tab_minmax
+        self.tab_settings  = ttk.Frame(self.content);     self.tabs["Settings"] = self.tab_settings
 
         self._build_dashboard()
         self._build_netgain_chart()
@@ -431,6 +442,7 @@ class Trading212App:
         for tab in self.tabs.values():
             tab.pack_forget()
         self.tabs[tab_name].pack(fill=BOTH, expand=True)
+
         if BOOTSTRAP:
             for btn in self.menu_btns.values():
                 btn.configure(bootstyle="secondary")
@@ -451,23 +463,21 @@ class Trading212App:
         ttk.Button(self.sidebar, text="Import CSV", bootstyle="primary", command=self.import_csv).pack(fill=X, pady=4, padx=8)
         ttk.Separator(self.sidebar).pack(fill=X, pady=15, padx=10)
 
-        # Stats tiles
         stats_grid = ttk.Frame(self.sidebar)
         stats_grid.pack(fill=X, padx=10, pady=8)
         stats_grid.columnconfigure(0, weight=1)
         stats_grid.columnconfigure(1, weight=1)
 
         stats = [
-            ("# Positions",     "📊", "—"),
-            ("Avg Position",    "💰", "—"),
-            ("Cash %",          "💸", "—"),
-            ("Total Deposits",  "🏦", "—"),
-            ("Deposits Count",  "🔢", "—"),
-            ("Market Buys",     "🛒", "—"),
-            ("Market Sells",    "💵", "—"),
-            ("Net Gain £",      "💰", "—"),
+            ("# Positions", "📊", "—"),
+            ("Avg Position", "💰", "—"),
+            ("Cash %", "💸", "—"),
+            ("Total Deposits", "🏦", "—"),
+            ("Deposits Count", "🔢", "—"),
+            ("Market Buys", "🛒", "—"),
+            ("Market Sells", "💵", "—"),
+            ("Net Gain £", "💰", "—"),
         ]
-
         self.stats_vars = {}
         self.stats_labels = {}
         for i, (label_text, icon, default) in enumerate(stats):
@@ -507,7 +517,7 @@ class Trading212App:
         self.countdown_label.pack(pady=(0, 10), padx=10, anchor='s')
 
     def show_help(self):
-        messagebox.showinfo("Help / About", f"{APP_NAME}\n\nA tool for managing Trading212 portfolios.\n\nVersion: 4.3\nBuilt with Tkinter, Pandas & Matplotlib.\n\nFor support, check readme.")
+        messagebox.showinfo("Help / About", f"{APP_NAME}\n\nA tool for managing Trading212 portfolios.\n\nVersion: 4.3\nBuilt with Tkinter, Pandas & Matplotlib.\n\nHover tooltips fixed - no more persistent or stacking tooltips.\nExtended time filters added to Net Gain History chart (1hr–24hr + All Time).")
 
     def update_countdown(self):
         now = time.time()
@@ -539,7 +549,6 @@ class Trading212App:
             try:
                 print("\n=== Refresh started ===")
                 self.root.after(0, lambda: self._set_total_return_text("Refreshing..."))
-
                 self.positions = self.service.fetch_positions()
 
                 min_max = load_min_max()
@@ -577,10 +586,9 @@ class Trading212App:
                     self.next_auto_refresh_time = time.time() + 60
 
                     summary = Analytics.calculate(self.df, self.positions, self.cash_balance)
-
-                    # ── SAVE NET GAIN HISTORY ───────────────────────────────
                     now_ts = time.time()
                     net_gain_value = summary['net_gain']
+
                     hist = load_net_gain_history()
                     hist.append({
                         "ts": now_ts,
@@ -591,9 +599,9 @@ class Trading212App:
 
                     buy_count = sell_count = 0
                     if not self.df.empty:
-                        buy_mask  = self.df['Type'].str.contains('buy',  case=False, na=False)
+                        buy_mask = self.df['Type'].str.contains('buy', case=False, na=False)
                         sell_mask = self.df['Type'].str.contains('sell', case=False, na=False)
-                        buy_count  = int(buy_mask.sum())
+                        buy_count = int(buy_mask.sum())
                         sell_count = int(sell_mask.sum())
 
                     tv = summary['total_assets']
@@ -656,7 +664,7 @@ class Trading212App:
             _task()
 
     # ────────────────────────────────────────────────
-    # DASHBOARD
+    # DASHBOARD (unchanged)
     # ────────────────────────────────────────────────
     def _build_dashboard(self):
         main = ttk.Frame(self.tab_dashboard, padding=20)
@@ -668,14 +676,13 @@ class Trading212App:
         self.card_vars = {}
         self.card_frames = {}
         cards = [
-            ("Portfolio Value",  "💰", "#4CAF50"),
-            ("Cash Available",   "💸", "#9C27B0"),
-            ("Total Return",     "📈", "#2196F3"),
-            ("TTM Dividends",    "📅", "#FFEB3B"),
-            ("Realised P/L",     "🏦", "#FF9800"),
-            ("Fees Paid",        "⚠️", "#F44336"),
+            ("Portfolio Value", "💰", "#4CAF50"),
+            ("Cash Available", "💸", "#9C27B0"),
+            ("Total Return", "📈", "#2196F3"),
+            ("TTM Dividends", "📅", "#FFEB3B"),
+            ("Realised P/L", "🏦", "#FF9800"),
+            ("Fees Paid", "⚠️", "#F44336"),
         ]
-
         for i, (title, emoji, color) in enumerate(cards):
             card = tb.Frame(cards_frame, bootstyle="dark", padding=14) if BOOTSTRAP else ttk.Frame(cards_frame)
             card.grid(row=i//3, column=i%3, padx=12, pady=10, sticky=EW)
@@ -723,16 +730,16 @@ class Trading212App:
         gain = s['net_gain']
         pct = s['total_return_pct']
         sign_gain = "+" if gain >= 0 else ""
-        sign_pct  = "+" if pct  >= 0 else ""
+        sign_pct = "+" if pct >= 0 else ""
         return_text = f"{sign_gain}£{round_money(gain):,.2f} ({sign_pct}{pct:.2f}%){session_change_str}"
         self.card_vars["Total Return"].set(return_text)
 
         if BOOTSTRAP and "Total Return" in self.card_frames:
-            if   pct > 10:  self.card_frames["Total Return"].configure(bootstyle="success")
-            elif pct > 3:   self.card_frames["Total Return"].configure(bootstyle="info")
-            elif pct > -3:  self.card_frames["Total Return"].configure(bootstyle="secondary")
-            elif pct > -10: self.card_frames["Total Return"].configure(bootstyle="warning")
-            else:           self.card_frames["Total Return"].configure(bootstyle="danger")
+            if pct > 10: self.card_frames["Total Return"].configure(bootstyle="success")
+            elif pct > 3: self.card_frames["Total Return"].configure(bootstyle="info")
+            elif pct > -3: self.card_frames["Total Return"].configure(bootstyle="secondary")
+            elif pct > -10:self.card_frames["Total Return"].configure(bootstyle="warning")
+            else: self.card_frames["Total Return"].configure(bootstyle="danger")
 
         self.card_vars["TTM Dividends"].set(f"£{round_money(s['ttm_dividends']):,.2f}")
         self.card_vars["Realised P/L"].set(f"£{round_money(s['realised_pl']):+,.2f}")
@@ -746,15 +753,15 @@ class Trading212App:
         self.stats_vars["Market Buys"].set(f"{buy_count:,d}")
         self.stats_vars["Market Sells"].set(f"{sell_count:,d}")
 
-        # Net Gain £ tile + color
         sign = "+" if net_gain >= 0 else ""
         self.stats_vars["Net Gain £"].set(f"{sign}£{round_money(net_gain):,.2f}")
+
         if "Net Gain £" in self.stats_labels:
             label = self.stats_labels["Net Gain £"]
             if net_gain > 0:
-                label.configure(foreground="#90EE90")     # light green
+                label.configure(foreground="#90EE90")
             elif net_gain < 0:
-                label.configure(foreground="#FF9999")     # light red
+                label.configure(foreground="#FF9999")
             else:
                 label.configure(foreground="white")
 
@@ -813,11 +820,43 @@ class Trading212App:
             self.canvas.draw()
 
     # ────────────────────────────────────────────────
-    # NET GAIN HISTORY CHART
+    # NET GAIN HISTORY CHART — with expanded time filters
     # ────────────────────────────────────────────────
     def _build_netgain_chart(self):
         frame = ttk.Frame(self.tab_netgain, padding=20)
         frame.pack(fill=BOTH, expand=True)
+
+        # Period filter buttons — all in one horizontal row
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill=X, pady=(0, 12))
+
+        periods = [
+            ("1hr",    "1hr"),
+            ("4hr",    "4hr"),
+            ("8hr",    "8hr"),
+            ("16hr",   "16hr"),
+            ("1d",     "1d"),
+            ("1w",     "1w"),
+            ("1m",     "1m"),
+            ("3m",     "3m"),
+            ("YTD",    "YTD"),
+            ("All Time", "All Time")
+        ]
+
+        self.period_buttons = {}
+
+        for label, value in periods:
+            btn = ttk.Button(
+                btn_frame,
+                text=label,
+                command=lambda v=value: self.set_netgain_period(v),
+                width=8
+            )
+            btn.pack(side=LEFT, padx=4, pady=3, fill=X, expand=False)
+            self.period_buttons[value] = btn
+
+        # Highlight default
+        self.set_netgain_period("1hr", update_buttons_only=True)
 
         if not MATPLOTLIB:
             ttk.Label(frame, text="Matplotlib not available", foreground="orange").pack(pady=40)
@@ -828,7 +867,7 @@ class Trading212App:
         ax.set_facecolor('#252535')
         ax.tick_params(colors='white')
         ax.grid(True, axis='y', alpha=0.12, color='gray', linestyle='--')
-        for spine in ['top','right']:
+        for spine in ['top', 'right']:
             ax.spines[spine].set_visible(False)
         ax.spines['left'].set_color('gray')
         ax.spines['bottom'].set_color('gray')
@@ -837,9 +876,50 @@ class Trading212App:
         ax.set_ylabel("Net Gain (£)", color='white')
 
         self.netgain_fig = fig
-        self.netgain_ax  = ax
+        self.netgain_ax = ax
         self.netgain_canvas = FigureCanvasTkAgg(fig, master=frame)
         self.netgain_canvas.get_tk_widget().pack(fill=BOTH, expand=True, padx=5, pady=5)
+
+    def set_netgain_period(self, period: str, update_buttons_only=False):
+        self.netgain_period_var.set(period)
+
+        # Update button styles
+        if BOOTSTRAP:
+            for val, btn in self.period_buttons.items():
+                btn.configure(bootstyle="primary" if val == period else "secondary")
+        else:
+            for val, btn in self.period_buttons.items():
+                btn.state(['!pressed'] if val != period else ['pressed'])
+
+        if not update_buttons_only:
+            self._render_netgain_chart()
+
+    def get_netgain_date_cutoff(self) -> Optional[datetime]:
+        period = self.netgain_period_var.get()
+        now = datetime.now()
+
+        if period in ("All Time", "All"):
+            return None
+        elif period == "YTD":
+            return datetime(now.year, 1, 1)
+        elif period == "3m":
+            return now - timedelta(days=90)
+        elif period == "1m":
+            return now - timedelta(days=30)
+        elif period == "1w":
+            return now - timedelta(days=7)
+        elif period == "1d":
+            return now - timedelta(days=1)
+        elif period == "16hr":               # ← updated
+            return now - timedelta(hours=16)
+        elif period == "8hr":
+            return now - timedelta(hours=8)
+        elif period == "4hr":
+            return now - timedelta(hours=4)
+        elif period == "1hr":
+            return now - timedelta(hours=1)
+        else:
+            return now - timedelta(days=30)  # fallback
 
     def _render_netgain_chart(self):
         if not MATPLOTLIB or not hasattr(self, 'netgain_ax'):
@@ -856,42 +936,98 @@ class Trading212App:
         times = [datetime.fromtimestamp(p['ts']) for p in hist]
         gains = [p['net_gain'] for p in hist]
 
-        # Optional: limit view to last N days
-        cutoff = datetime.now() - timedelta(days=HISTORY_PLOT_DAYS)
-        mask = [t >= cutoff for t in times]
-        times = [t for t, m in zip(times, mask) if m]
-        gains = [g for g, m in zip(gains, mask) if m]
+        # Apply selected time range filter
+        cutoff = self.get_netgain_date_cutoff()
+        if cutoff is not None:
+            mask = [t >= cutoff for t in times]
+            times = [t for t, m in zip(times, mask) if m]
+            gains = [g for g, m in zip(gains, mask) if m]
+
+        if not times or not gains:
+            self.netgain_ax.clear()
+            self.netgain_ax.text(0.5, 0.5, f"No data in selected period ({self.netgain_period_var.get()})",
+                                ha='center', va='center', color='gray', fontsize=12)
+            self.netgain_canvas.draw()
+            return
+
+        # Clean up ALL existing annotations BEFORE clearing axes
+        for artist in list(self.netgain_fig.get_children()):
+            if isinstance(artist, mtext.Annotation):
+                try: artist.remove()
+                except: pass
+        for artist in list(self.netgain_ax.get_children()):
+            if isinstance(artist, mtext.Annotation):
+                try: artist.remove()
+                except: pass
 
         self.netgain_ax.clear()
 
-        self.netgain_ax.plot(times, gains, color='#BB86FC', linewidth=1.8,
-                             marker='o', markersize=3, alpha=0.9)
+        if gains:
+            min_g = min(gains)
+            max_g = max(gains)
+            data_span = max_g - min_g
+            abs_peak = max(abs(min_g), abs(max_g), 0.01)
+            min_visible_half = 0.40
+            padding_factor = 1.4
+            half_span = max(data_span / 2 * padding_factor, min_visible_half, abs_peak * 1.5)
+            center = (max_g + min_g) / 2
+            self.netgain_ax.set_ylim(center - half_span, center + half_span)
 
-        # Zero line
+        line, = self.netgain_ax.plot(
+            times, gains,
+            color='#BB86FC',
+            linewidth=1.8,
+            marker='o',
+            markersize=3,
+            alpha=0.9
+        )
+
         if gains:
             self.netgain_ax.axhline(0, color='gray', lw=0.8, ls='--', alpha=0.5)
 
-        # Optional: light fill above/below zero
-        import numpy as np
-        self.netgain_ax.fill_between(times, gains, 0,
-                                     where=(np.array(gains) >= 0),
-                                     color='#4CAF50', alpha=0.08)
-        self.netgain_ax.fill_between(times, gains, 0,
-                                     where=(np.array(gains) < 0),
-                                     color='#EF5350', alpha=0.08)
+        self.netgain_ax.fill_between(
+            times, gains, 0,
+            where=(np.array(gains) >= 0),
+            color='#4CAF50', alpha=0.08
+        )
+        self.netgain_ax.fill_between(
+            times, gains, 0,
+            where=(np.array(gains) < 0),
+            color='#EF5350', alpha=0.08
+        )
 
         self.netgain_ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b'))
         self.netgain_ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=12))
         plt.setp(self.netgain_ax.get_xticklabels(), rotation=35, ha='right')
 
         self.netgain_ax.yaxis.set_major_formatter(
-            plt.FuncFormatter(lambda y, _: f'£{int(y):,}'))
+            plt.FuncFormatter(lambda y, _: f'£{y:,.2f}' if abs(y) < 10 else f'£{int(y):,}')
+        )
+
+        # Hover tooltips
+        if MPLCURSORS_AVAILABLE and times and gains:
+            cursor = mplcursors.cursor(
+                line,
+                hover=True,
+                highlight=True
+            )
+            @cursor.connect("add")
+            def on_hover(sel):
+                dt = mdates.num2date(sel.target[0])
+                date_str = dt.strftime("%Y-%m-%d %H:%M")
+                value = sel.target[1]
+                sel.annotation.set_text(f"{date_str}\n£{value:,.2f}")
+                sel.annotation.get_bbox_patch().set_alpha(0.92)
+                sel.annotation.get_bbox_patch().set_facecolor("#2d2d44")
+                sel.annotation.get_bbox_patch().set_edgecolor("#bb86fc")
+                sel.annotation.set_color("white")
+                sel.annotation.xy = sel.target
 
         self.netgain_fig.tight_layout()
         self.netgain_canvas.draw()
 
     # ────────────────────────────────────────────────
-    # TRANSACTIONS TAB (unchanged logic)
+    # TRANSACTIONS TAB (unchanged)
     # ────────────────────────────────────────────────
     def _build_transactions(self):
         filter_bar = ttk.Frame(self.tab_transactions)
@@ -923,10 +1059,10 @@ class Trading212App:
         tree_frame.rowconfigure(0, weight=1)
 
         self.tree_tx.tag_configure('even', background='#222233')
-        self.tree_tx.tag_configure('odd',  background='#1a1a2a')
+        self.tree_tx.tag_configure('odd', background='#1a1a2a')
         self.tree_tx.tag_configure('highlight', background='#3a3a55')
-        self.tree_tx.tag_configure('buy',      foreground='#66BB6A')
-        self.tree_tx.tag_configure('sell',     foreground='#EF5350')
+        self.tree_tx.tag_configure('buy', foreground='#66BB6A')
+        self.tree_tx.tag_configure('sell', foreground='#EF5350')
         self.tree_tx.tag_configure('dividend', foreground='#FFCA28')
         self.tree_tx.tag_configure('total', font=('Segoe UI', 10, 'bold'), foreground='#BB86FC')
 
@@ -948,7 +1084,7 @@ class Trading212App:
             values = [row.get(c, '') for c in self.tree_tx['columns']]
             tags = ['even' if idx % 2 == 0 else 'odd']
             ttype = str(row.get('Type', '')).lower()
-            if 'buy'  in ttype: tags.append('buy')
+            if 'buy' in ttype: tags.append('buy')
             elif 'sell' in ttype: tags.append('sell')
             elif 'dividend' in ttype: tags.append('dividend')
             self.tree_tx.insert('', 'end', values=values, tags=tags)
@@ -967,7 +1103,7 @@ class Trading212App:
             self.tree_tx.insert('', 'end', values=formatted, tags=('total',))
 
     # ────────────────────────────────────────────────
-    # POSITIONS TAB (unchanged logic)
+    # POSITIONS TAB (unchanged)
     # ────────────────────────────────────────────────
     def _build_positions(self):
         frame = ttk.Frame(self.tab_positions, padding=12)
@@ -992,19 +1128,19 @@ class Trading212App:
         frame.rowconfigure(0, weight=1)
 
         self.tree_pos.tag_configure('even', background='#222233')
-        self.tree_pos.tag_configure('odd',  background='#1a1a2a')
+        self.tree_pos.tag_configure('odd', background='#1a1a2a')
         self.tree_pos.tag_configure('profit', foreground='#66BB6A')
-        self.tree_pos.tag_configure('loss',   foreground='#EF5350')
+        self.tree_pos.tag_configure('loss', foreground='#EF5350')
         self.tree_pos.tag_configure('total', font=('Segoe UI', 10, 'bold'), foreground='#BB86FC')
 
         self._render_positions()
 
     def _render_positions(self):
         self.tree_pos.delete(*self.tree_pos.get_children(''))
-        sorted_pos = sorted(self.positions, key=lambda x: -x.est_value if x.quantity > 0 else 0)
 
+        sorted_pos = sorted(self.positions, key=lambda x: -x.est_value if x.quantity > 0 else 0)
         total_value = sum(p.est_value for p in sorted_pos)
-        total_pl   = sum(p.unrealised_pl for p in sorted_pos)
+        total_pl = sum(p.unrealised_pl for p in sorted_pos)
         total_cost = sum(p.total_cost for p in sorted_pos)
 
         for idx, p in enumerate(sorted_pos):
@@ -1029,7 +1165,7 @@ class Trading212App:
         self.tree_pos.insert('', 'end', values=footer, tags=('total',))
 
     # ────────────────────────────────────────────────
-    # MIN/MAX TAB (unchanged logic)
+    # HISTORICAL HIGHS & LOWS TAB (unchanged)
     # ────────────────────────────────────────────────
     def _build_minmax(self):
         frame = ttk.Frame(self.tab_minmax, padding=12)
@@ -1055,13 +1191,14 @@ class Trading212App:
         frame.rowconfigure(0, weight=1)
 
         self.tree_minmax.tag_configure('even', background='#222233')
-        self.tree_minmax.tag_configure('odd',  background='#1a1a2a')
+        self.tree_minmax.tag_configure('odd', background='#1a1a2a')
         self.tree_minmax.tag_configure('closed', foreground='gray')
 
         self._render_minmax()
 
     def _render_minmax(self):
         self.tree_minmax.delete(*self.tree_minmax.get_children(''))
+
         min_max = load_min_max()
         current_tickers = {p.ticker: p for p in self.positions}
         sorted_tickers = sorted(min_max.keys())
@@ -1098,7 +1235,7 @@ class Trading212App:
             self.tree_minmax.insert('', 'end', values=vals, tags=tags)
 
     # ────────────────────────────────────────────────
-    # SETTINGS TAB (unchanged logic)
+    # SETTINGS TAB (unchanged)
     # ────────────────────────────────────────────────
     def _build_settings(self):
         f = ttk.Frame(self.tab_settings, padding=30)
@@ -1171,6 +1308,7 @@ class Trading212App:
             }, regex=True)
 
             df_new['Date'] = pd.to_datetime(df_new.get('Date'), errors='coerce')
+
             for col in ['Quantity','Price','Total','Fee','Result','FX_Rate']:
                 if col in df_new.columns:
                     df_new[col] = pd.to_numeric(df_new[col], errors='coerce').fillna(0)
@@ -1204,7 +1342,6 @@ class Trading212App:
             self.df = self.repo.deduplicate(self.df.fillna({'Ticker':'-','Note':''}))
             self.df = self.df.sort_values('Date', ascending=False).reset_index(drop=True)
             self.repo.save(self.df)
-
             self.render_transactions()
 
             added_count = len(new_rows)
