@@ -1,4 +1,4 @@
-# Trading212 Portfolio Pro v4.3
+# Trading212 Portfolio Pro v4.7
 
 **A real-time Trading 212 portfolio dashboard with accurate net gain history, persistent tracking, smart warnings, and a polished modern UI.**
 
