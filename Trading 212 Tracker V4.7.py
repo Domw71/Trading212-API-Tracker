@@ -55,7 +55,7 @@ except ImportError:
 # ────────────────────────────────────────────────
 # CONFIG
 # ────────────────────────────────────────────────
-APP_NAME = "Trading212 Portfolio Pro v4.7 REV: 26"
+APP_NAME = "Trading212 Portfolio Pro v4.7 (REV: 28)"
 DATA_DIR = "data"
 CSV_FILE = os.path.join(DATA_DIR, "transactions.csv")
 CACHE_FILE = os.path.join(DATA_DIR, "positions_cache.json")
@@ -1605,3 +1605,4 @@ if __name__ == '__main__':
     root = tb.Window(themename="darkly") if BOOTSTRAP else tk.Tk()
     app = Trading212App(root)
     root.mainloop()
+
