@@ -67,6 +67,7 @@ NOTES_FILE = os.path.join(DATA_DIR, "notes.json")
 ALL_INSTRUMENTS_FILE = os.path.join(DATA_DIR, "all_instruments.json")
 WATCHLIST_FILE = os.path.join(DATA_DIR, "watchlist.json")
 NOTIFICATIONS_FILE = os.path.join(DATA_DIR, "notifications.json")
+CSV_IMPORTS_DIR = os.path.join(DATA_DIR, "CSV_IMPORTS")
 
 BASE_URL = "https://live.trading212.com/api/v0"
 CACHE_TTL = 30
@@ -82,6 +83,82 @@ ANOMALY_THRESHOLD_PCT = 0.02
 NETGAIN_SMOOTH_WINDOW = 5
 
 os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(CSV_IMPORTS_DIR, exist_ok=True)
+
+#Backup dir..
+
+BACKUP_DIR = os.path.join(DATA_DIR, "backups")
+os.makedirs(BACKUP_DIR, exist_ok=True)
+
+IMPORTANT_FILES = [
+    "transactions.csv",
+    "positions_cache.json",
+    "settings.json",
+    "min_max.json",
+    "net_gain_history.json",
+    "price_history.json",
+    "anomaly_log.json",
+    "notes.json",
+    "all_instruments.json",
+    "watchlist.json",
+    "notifications.json",
+]
+
+
+#Back ups data every hour. 
+
+def create_hourly_backup():
+    """Create timestamped copies of all important files"""
+    now = datetime.now()
+    timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
+    backup_subdir = os.path.join(BACKUP_DIR, f"backup_{timestamp}")
+    os.makedirs(backup_subdir, exist_ok=True)
+
+    copied = 0
+    for filename in IMPORTANT_FILES:
+        src = os.path.join(DATA_DIR, filename)
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join(backup_subdir, filename)
+        try:
+            with open(src, 'rb') as fsrc:
+                with open(dst, 'wb') as fdst:
+                    fdst.write(fsrc.read())
+            copied += 1
+        except Exception as e:
+            print(f"Backup failed for {filename}: {e}")
+
+    if copied > 0:
+        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Hourly backup created: {backup_subdir} ({copied} files)")
+    else:
+        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] No files to backup")
+
+#Keeps 2 days worth of backups 48 folders worth of data
+
+def cleanup_old_backups(max_keep=48):
+    subdirs = sorted(
+        [d for d in os.listdir(BACKUP_DIR) if d.startswith("backup_")],
+        key=lambda x: datetime.strptime(x[7:], "%Y-%m-%d_%H-%M-%S"),
+        reverse=True
+    )
+    for old in subdirs[max_keep:]:
+        path = os.path.join(BACKUP_DIR, old)
+        try:
+            import shutil
+            shutil.rmtree(path)
+            print(f"Removed old backup: {old}")
+        except:
+            pass
+
+def start_hourly_backup_loop():
+    """Run backup every hour in background thread"""
+    def loop():
+        while True:
+            create_hourly_backup()
+            for _ in range(60):
+                time.sleep(60)
+
+    threading.Thread(target=loop, daemon=True, name="HourlyBackup").start()
 
 # ────────────────────────────────────────────────
 # NOTIFICATION HELPERS
@@ -541,6 +618,12 @@ class Trading212App:
         self.refresh(async_fetch=True)
         self.update_countdown()
 
+        #Backups Data Every Hour.
+        start_hourly_backup_loop()
+        #Deletes Old Backups Every 2 days.
+        cleanup_old_backups(max_keep=168)
+        
+
         self.root.bind_all("<Control-s>", lambda event: self.save_notes() if hasattr(self, 'notes_text') else None)
 
         def auto_refresh_loop():
@@ -762,8 +845,8 @@ class Trading212App:
                 self.root.after(0, self.update_watchlist_prices)
                 self.root.after(0, self.update_countdown)
             except Exception as e:
-                self.root.after(0, lambda: self._set_total_return_text(f"Error: {str(e)}"))
-                self.root.after(0, lambda: self.refresh_label.config(text=f"Error: {str(e)}", foreground='red'))
+                msg = f"Error: {str(e)}"
+                self.root.after(0, lambda err=msg: self.refresh_label.config(text=err, foreground='yellow'))
         now = time.time()
         if not is_auto_retry and self.cooldown_end_time > now:
             rem = int(self.cooldown_end_time - now) + 1
@@ -813,26 +896,25 @@ class Trading212App:
             chart_frame.pack(
                 fill=BOTH, 
                 expand=True, 
-                pady=(0, 0),     # ← remove top/bottom padding → no white space vertically
-                padx=0           # ← remove side padding → no white space horizontally
+                pady=(0, 0),
+                padx=0          
             )
 
             # Make the figure much bigger and fill the space aggressively
             self.fig = Figure(
-                figsize=(22, 13),          # ← bigger overall size (width × height in inches)
+                figsize=(22, 13),          
                 facecolor='#1e1e2f',
                 constrained_layout=True
             )
 
-            # Very tight layout: panels close together, minimal internal margins
             gs = self.fig.add_gridspec(
                 2, 2,
-                wspace=0.12,               # ← very small horizontal gap between panels
-                hspace=0.14,               # ← very small vertical gap between panels
-                left=0.04,                 # almost no left margin
-                right=0.98,                # almost no right margin
-                top=0.96,                  # almost no top margin
-                bottom=0.06                # minimal bottom for x-labels (still readable)
+                wspace=0.12,               
+                hspace=0.14,              
+                left=0.04,                
+                right=0.98,                
+                top=0.96,                 
+                bottom=0.06                
             )
 
             self.ax1 = self.fig.add_subplot(gs[0, 0])
@@ -853,13 +935,27 @@ class Trading212App:
             self.canvas.get_tk_widget().pack(
                 fill=BOTH, 
                 expand=True, 
-                padx=0,                   # ← no padding around canvas → fills edge-to-edge
+                padx=0,
                 pady=0
             )
         
+    # ────────────────────────────────────────────────
+    # HELPER – SMART P/L FORMATTING
+    # ────────────────────────────────────────────────
+    def smart_pnl_label(self, val: float) -> str:
+        """
+        Always show two decimal places — never rounds away small differences
+        """
+        if abs(val) < 0.005:
+            return "£0.00"
+        return f"£{val:+,.2f}"
+
+    # ────────────────────────────────────────────────
+    # DASHBOARD RENDERING – FIXED LABELS
+    # ────────────────────────────────────────────────
     def _render_dashboard(self, s: Dict, num_pos: int, avg_pos: float, cash_pct: float,
-                      session_change_str: str = "", buy_count: int = 0, sell_count: int = 0,
-                      net_gain: float = 0.0):
+                         session_change_str: str = "", buy_count: int = 0, sell_count: int = 0,
+                         net_gain: float = 0.0):
         """
         Renders the main dashboard with four-panel layout:
         1. Position values (with return % labels)
@@ -867,11 +963,10 @@ class Trading212App:
         3. Top winners
         4. Top losers
         """
-        # ── Update KPI cards (unchanged core logic)
+        # ── Update KPI cards (unchanged)
         self.card_vars["Portfolio Value"].set(f"£{round_money(s['holdings_value']):,.2f}")
-        #self.card_vars["Portfolio Value"].set(f"£{round_money(s['total_assets']):,.2f}")
         self.card_vars["Cash Available"].set(f"£{round_money(self.cash_balance):,.2f} ({cash_pct:.1f}%)")
-
+        
         gain = s['net_gain']
         pct = s['total_return_pct']
         sign_g = "+" if gain >= 0 else ""
@@ -884,14 +979,14 @@ class Trading212App:
             if pct > 12:   card.configure(bootstyle="success")
             elif pct > 4:  card.configure(bootstyle="info")
             elif pct > -4: card.configure(bootstyle="secondary")
-            elif pct > -12: card.configure(bootstyle="warning")
+            elif pct > -12:card.configure(bootstyle="warning")
             else:          card.configure(bootstyle="danger")
 
         self.card_vars["TTM Dividends"].set(f"£{round_money(s['ttm_dividends']):,.2f}")
         self.card_vars["Realised P/L"].set(f"£{round_money(s['realised_pl']):+,.2f}")
         self.card_vars["Fees Paid"].set(f"£{round_money(s['fees']):,.2f}")
 
-        # ── Sidebar stats
+        # ── Sidebar stats (unchanged)
         self.stats_vars["# Positions"].set(f"{num_pos}")
         self.stats_vars["Avg Position"].set(f"£{round_money(avg_pos):,.0f}")
         self.stats_vars["Cash %"].set(f"{cash_pct:.1f}%")
@@ -906,7 +1001,7 @@ class Trading212App:
             lbl = self.stats_labels["Net Gain £"]
             lbl.configure(foreground="#90EE90" if net_gain > 0 else "#FF9999" if net_gain < 0 else "white")
 
-        # ── Warnings
+        # ── Warnings (unchanged)
         warnings = []
         min_ago = (time.time() - self.last_successful_refresh) / 60 if self.last_successful_refresh else 999
         if min_ago > STALE_THRESHOLD_MIN:
@@ -928,8 +1023,8 @@ class Trading212App:
         active = [p for p in self.positions if p.est_value > 0 and p.quantity > 0]
         if not active:
             for ax, title in zip([self.ax1, self.ax2, self.ax3, self.ax4],
-                                 ["No active positions", "No allocation data",
-                                  "No winners yet", "No losers yet"]):
+                                ["No active positions", "No allocation data",
+                                 "No winners yet", "No losers yet"]):
                 ax.text(0.5, 0.5, title, ha='center', va='center', color='gray', fontsize=12)
             self.canvas.draw()
             return
@@ -939,28 +1034,38 @@ class Trading212App:
         # ── Panel 1: Position values + return % labels
         show_count = min(MAX_BAR_TICKERS, len(sorted_active))
         tickers = [p.ticker for p in sorted_active[:show_count]]
-        values  = [p.est_value for p in sorted_active[:show_count]]
-        colors  = ['#66BB6A' if p.unrealised_pl >= 0 else '#EF5350' for p in sorted_active[:show_count]]
+        values = [p.est_value for p in sorted_active[:show_count]]
+        colors = ['#66BB6A' if p.unrealised_pl >= 0 else '#EF5350' for p in sorted_active[:show_count]]
 
         bars = self.ax1.bar(tickers, values, color=colors, edgecolor='gray', linewidth=0.7)
         self.ax1.tick_params(axis='x', rotation=55, labelsize=9.5)
         self.ax1.set_title(f"Position Values – Top {show_count}", fontsize=13, pad=10)
 
-        # Labels on bars
+        # Labels on bars – FIXED
         for bar, pos in zip(bars, sorted_active[:show_count]):
             height = bar.get_height()
             ret_pct = (pos.unrealised_pl / pos.total_cost * 100) if pos.total_cost > 0 else 0
-            label = f"£{round_money(height):,.0f}\n{ret_pct:+.1f}%"
+            
+            label = f"{self.smart_pnl_label(height)}\n{ret_pct:+.1f}%"
+            color = '#4CAF50' if height >= 0 else '#EF5350'
+
             va = 'bottom' if height >= 0 else 'top'
             offset = height * 0.015 if height >= 0 else height * -0.015
-            self.ax1.text(bar.get_x() + bar.get_width()/2, height + offset,
-                          label, ha='center', va=va, fontsize=8.5, color='white',
-                          fontweight='bold', bbox=dict(facecolor='black', alpha=0.55, pad=1.6, lw=0))
 
-        # ── Panel 2: Top allocation (horizontal)
+            self.ax1.text(
+                bar.get_x() + bar.get_width()/2,
+                height + offset,
+                label,
+                ha='center', va=va,
+                fontsize=8.5, color=color,
+                fontweight='bold',
+                bbox=dict(facecolor='black', alpha=0.55, pad=1.6, lw=0)
+            )
+
+        # ── Panel 2: Top allocation (horizontal) – unchanged
         alloc_sorted = sorted(active, key=lambda x: -x.portfolio_pct)[:12]
         alloc_labels = [p.ticker for p in alloc_sorted]
-        alloc_sizes  = [p.portfolio_pct for p in alloc_sorted]
+        alloc_sizes = [p.portfolio_pct for p in alloc_sorted]
 
         self.ax2.barh(alloc_labels[::-1], alloc_sizes[::-1],
                       color=plt.cm.tab20b(np.linspace(0.1, 0.9, len(alloc_labels))))
@@ -971,10 +1076,9 @@ class Trading212App:
         for i, val in enumerate(alloc_sizes[::-1]):
             self.ax2.text(val + 0.4, i, f"{val:.1f}%", va='center', fontsize=9.5, color='white')
 
-        # ── Panel 3: Top winners
+        # ── Panel 3: Top winners – FIXED labels
         winners = sorted([p for p in active if p.unrealised_pl > 0],
                          key=lambda x: -x.unrealised_pl)[:5]
-
         if winners:
             win_tickers = [p.ticker for p in winners]
             win_pl = [p.unrealised_pl for p in winners]
@@ -982,19 +1086,25 @@ class Trading212App:
             self.ax3.set_title("Top 5 Winners (£)", fontsize=12.5, pad=10)
             self.ax3.invert_yaxis()
             max_win = max(win_pl, default=1)
+
             for i, v in enumerate(win_pl[::-1]):
-                self.ax3.text(v + max_win * 0.02, i, f"£{v:,.0f}", va='center',
-                              fontsize=9.5, color='white')
+                self.ax3.text(
+                    v + max_win * 0.02,
+                    i,
+                    self.smart_pnl_label(v),
+                    va='center',
+                    fontsize=9.5,
+                    color='#4CAF50'   # green
+                )
         else:
             self.ax3.text(0.5, 0.5, "No positions\ncurrently in profit",
                           ha='center', va='center', color='#777777', fontsize=11,
                           fontstyle='italic')
             self.ax3.set_title("Top Winners", fontsize=12.5, pad=10)
 
-        # ── Panel 4: Top losers
+        # ── Panel 4: Top losers – FIXED labels
         losers = sorted([p for p in active if p.unrealised_pl < 0],
-                        key=lambda x: x.unrealised_pl)[:5]   # most negative first
-
+                        key=lambda x: x.unrealised_pl)[:5]
         if losers:
             lose_tickers = [p.ticker for p in losers]
             lose_pl = [p.unrealised_pl for p in losers]
@@ -1002,37 +1112,22 @@ class Trading212App:
             self.ax4.set_title("Top 5 Losers (£)", fontsize=12.5, pad=10)
             self.ax4.invert_yaxis()
             max_lose = min(lose_pl, default=-1)
+
             for i, v in enumerate(lose_pl[::-1]):
-                self.ax4.text(v - abs(max_lose) * 0.02, i, f"£{v:,.0f}", va='center',
-                              fontsize=9.5, color='white')
+                self.ax4.text(
+                    v - abs(max_lose) * 0.02,
+                    i,
+                    self.smart_pnl_label(v),
+                    va='center',
+                    fontsize=9.5,
+                    color='white'   # red
+                )
         else:
             self.ax4.text(0.5, 0.5, "No positions\ncurrently in loss",
                           ha='center', va='center', color='#777777', fontsize=11,
                           fontstyle='italic')
             self.ax4.set_title("Top Losers", fontsize=12.5, pad=10)
 
-        # ── Summary box (bottom-left corner)
-        total_unreal_pl = sum(p.unrealised_pl for p in active)
-        total_cost = sum(p.total_cost for p in active)
-        unreal_pl_pct = (total_unreal_pl / total_cost * 100) if total_cost > 0 else 0
-        profitable_count = sum(1 for p in active if p.unrealised_pl > 0)
-        top3_conc = sum(p.portfolio_pct for p in sorted_active[:3])
-
-        #summary_lines = [
-            #f"Total Unrealised P/L: £{total_unreal_pl:+,.0f}  ({unreal_pl_pct:+.1f}%)",
-            #f"Profitable / Total positions: {profitable_count} / {len(active)}",
-        #]
-        #if top3_conc > 40:
-            #summary_lines.append(f"Top 3 concentration: {top3_conc:.1f}% ⚠️")
-
-        #summary_text = "\n".join(summary_lines)
-
-        #self.fig.suptitle("Portfolio Overview", fontsize=16, y=0.98, color='white')
-        #self.fig.text(0.015, 0.015, summary_text, fontsize=10.2, color='lightgray',
-                      #va='bottom', ha='left',
-                      #bbox=dict(facecolor='#1e1e2f', alpha=0.75, boxstyle='round,pad=0.5'))
-
-        # No tight_layout needed when using constrained_layout=True
         self.canvas.draw()
 
     # ────────────────────────────────────────────────
@@ -1059,6 +1154,16 @@ class Trading212App:
             self.period_buttons[value] = btn
         
         self.set_netgain_period("1d", update_buttons_only=True)
+
+        self.compress_weekends_var = tk.BooleanVar(value=True)
+
+        compress_chk = ttk.Checkbutton(
+            btn_frame,
+            text="Compress weekends (no gaps)",
+            variable=self.compress_weekends_var,
+            command=self._render_netgain_chart
+        )
+        compress_chk.pack(side=LEFT, padx=12, pady=3)
         
         if not MATPLOTLIB:
             ttk.Label(frame, text="Matplotlib not available", foreground="orange").pack(pady=40)
@@ -1082,7 +1187,6 @@ class Trading212App:
         self.netgain_canvas = FigureCanvasTkAgg(fig, master=frame)
         self.netgain_canvas.get_tk_widget().pack(fill=BOTH, expand=True, padx=5, pady=5)
         
-        # Initialize cursor placeholder
         self.netgain_cursor = None
 
     def set_netgain_period(self, period: str, update_buttons_only=False):
@@ -1111,105 +1215,158 @@ class Trading212App:
     def _render_netgain_chart(self):
         if not MATPLOTLIB or not hasattr(self, 'netgain_ax'):
             return
-        
+
         hist = load_net_gain_history()
         if not hist:
             self.netgain_ax.clear()
             self.netgain_ax.text(0.5, 0.5, "No history yet", ha='center', va='center', color='gray')
             self.netgain_canvas.draw()
             return
-        
+
         df_hist = pd.DataFrame(hist)
         cutoff = self.get_netgain_date_cutoff()
         if cutoff:
             df_hist = df_hist[df_hist['ts'].apply(lambda t: datetime.fromtimestamp(t) >= cutoff)]
-        
+
         if len(df_hist) >= NETGAIN_SMOOTH_WINDOW:
             df_hist['net_gain'] = (
                 df_hist['net_gain']
                 .rolling(window=NETGAIN_SMOOTH_WINDOW, center=True, min_periods=1)
                 .median()
             )
-        
+
         times = [datetime.fromtimestamp(t) for t in df_hist['ts']]
         gains = df_hist['net_gain'].tolist()
-        
+
         if not times:
             self.netgain_ax.clear()
             self.netgain_ax.text(0.5, 0.5, "No data in period", ha='center', va='center', color='gray')
             self.netgain_canvas.draw()
             return
-        
+
         p = self.netgain_period_var.get()
         if p in ("All Time", "All") and len(times) > CHART_DOWNSAMPLE_THRESHOLD:
             step = max(1, len(times) // 2000)
             times = times[::step]
             gains = gains[::step]
-        
+
         # ── CLEANUP PHASE ───────────────────────────────────────────────
         self.netgain_ax.clear()
-        
-        # Remove old annotations
+
         for artist in list(self.netgain_ax.get_children()):
             if isinstance(artist, mtext.Annotation):
                 try:
                     artist.remove()
                 except:
                     pass
-        
-        # Remove previous cursor if it exists
+
         if hasattr(self, 'netgain_cursor') and self.netgain_cursor is not None:
             try:
                 self.netgain_cursor.remove()
             except:
                 pass
         self.netgain_cursor = None
-        
+
+        # ── Decide whether to compress weekends ─────────────────────────
+        compress_weekends = self.compress_weekends_var.get() # ← true / false 
+
         # ── PLOTTING ────────────────────────────────────────────────────
         if gains:
             min_g, max_g = min(gains), max(gains)
-            span = max_g - min_g
+            span = max_g - min_g if gains else 10
             center = (max_g + min_g) / 2
             half = max(span * 0.7, 5, abs(max_g)*1.2, abs(min_g)*1.2)
             self.netgain_ax.set_ylim(center - half, center + half)
-        
-        line, = self.netgain_ax.plot(
-            times, gains,
-            color='#BB86FC', lw=1.8, marker='o', ms=3, alpha=0.9
-        )
-        
+
+        if compress_weekends and len(times) >= 5:  
+            x = np.arange(len(times))
+            line, = self.netgain_ax.plot(
+                x, gains,
+                color='#BB86FC', lw=1.8, marker='o', ms=3, alpha=0.9
+            )
+
+            # ── Smart date labels on compressed axis ────────────────────
+            # Aim for ~8–12 labels
+            desired_n_ticks = 10
+            step = max(1, len(times) // desired_n_ticks)
+
+            tick_indices = list(range(0, len(times), step))
+            # Make sure we include the last point
+            if tick_indices[-1] != len(times) - 1:
+                tick_indices.append(len(times) - 1)
+
+            tick_dates = [times[i] for i in tick_indices]
+
+            # Format labels — adjust format depending on zoom level
+            if (times[-1] - times[0]).days > 180:
+                fmt = '%d %b %Y'
+            elif (times[-1] - times[0]).days > 14:
+                fmt = '%d %b'
+            else:
+                fmt = '%d %b %H:%M'
+
+            self.netgain_ax.set_xticks(tick_indices)
+            self.netgain_ax.set_xticklabels(
+                [t.strftime(fmt) for t in tick_dates],
+                rotation=35, ha='right'
+            )
+
+        else:
+            # Original datetime-based plotting (with gaps)
+            line, = self.netgain_ax.plot(
+                times, gains,
+                color='#BB86FC', lw=1.8, marker='o', ms=3, alpha=0.9
+            )
+
+            self.netgain_ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b'))
+            self.netgain_ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=12))
+            plt.setp(self.netgain_ax.get_xticklabels(), rotation=35, ha='right')
+
+        # Common parts ───────────────────────────────────────────────────
         self.netgain_ax.axhline(0, color='gray', lw=0.8, ls='--', alpha=0.5)
-        self.netgain_ax.fill_between(times, gains, 0,
-                                     where=np.array(gains)>=0,
-                                     color='#4CAF50', alpha=0.08)
-        self.netgain_ax.fill_between(times, gains, 0,
-                                     where=np.array(gains)<0,
-                                     color='#EF5350', alpha=0.08)
-        
-        self.netgain_ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b'))
-        self.netgain_ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=12))
-        plt.setp(self.netgain_ax.get_xticklabels(), rotation=35, ha='right')
-        
-        self.netgain_ax.yaxis.set_major_formatter(
-            plt.FuncFormatter(lambda y, _: f'£{y:,.0f}' if abs(y)>=10 else f'£{y:,.2f}')
+
+        self.netgain_ax.fill_between(
+            times if not compress_weekends else x,
+            gains, 0,
+            where=np.array(gains) >= 0,
+            color='#4CAF50', alpha=0.08
         )
-        
-        # ── TOOLTIP (only create if mplcursors is available) ────────────
+        self.netgain_ax.fill_between(
+            times if not compress_weekends else x,
+            gains, 0,
+            where=np.array(gains) < 0,
+            color='#EF5350', alpha=0.08
+        )
+
+        self.netgain_ax.yaxis.set_major_formatter(
+            plt.FuncFormatter(lambda y, _: f'£{y:,.0f}' if abs(y) >= 10 else f'£{y:,.2f}')
+        )
+
+        # ── TOOLTIP ─────────────────────────────────────────────────────
         if MPLCURSORS_AVAILABLE:
             self.netgain_cursor = mplcursors.cursor(line, hover=True)
-            
+
             @self.netgain_cursor.connect("add")
             def _(sel):
-                dt = mdates.num2date(sel.target[0]).strftime("%Y-%m-%d %H:%M")
+                if compress_weekends:
+                    # Get real date from index
+                    idx = int(round(sel.target[0]))
+                    if 0 <= idx < len(times):
+                        dt_str = times[idx].strftime("%Y-%m-%d %H:%M")
+                    else:
+                        dt_str = "?"
+                else:
+                    dt_str = mdates.num2date(sel.target[0]).strftime("%Y-%m-%d %H:%M")
+
                 val = sel.target[1]
-                sel.annotation.set_text(f"{dt}\n£{val:,.2f}")
+                sel.annotation.set_text(f"{dt_str}\n£{val:,.2f}")
                 sel.annotation.get_bbox_patch().set_facecolor("#2d2d44")
                 sel.annotation.get_bbox_patch().set_edgecolor("#bb86fc")
                 sel.annotation.get_bbox_patch().set_alpha(0.94)
                 sel.annotation.set_color("white")
                 sel.annotation.xy = sel.target
                 sel.annotation.get_bbox_patch().set_boxstyle("round,pad=0.5")
-        
+
         self.netgain_fig.tight_layout()
         self.netgain_canvas.draw()
 
@@ -1224,29 +1381,39 @@ class Trading212App:
         self.tx_filter_var = StringVar()
         ttk.Entry(filter_bar, textvariable=self.tx_filter_var, width=45).pack(side=LEFT, padx=6)
         self.tx_filter_var.trace('w', lambda *a: self.render_transactions())
+
         tree_frame = ttk.Frame(self.tab_transactions)
         tree_frame.pack(fill=BOTH, expand=True, padx=5, pady=5)
-        cols = ["Date", "Type", "Ticker", "Quantity", "Price", "Total", "Fee", "Result", "Note"]
+
+        cols = ["Date", "Type", "Ticker", "Quantity", "Price", "Total", "Fee", "Result", "Note", "Reference"]
+        
         self.tree_tx = ttk.Treeview(tree_frame, columns=cols, show='headings')
+        
         for c in cols:
             self.tree_tx.heading(c, text=c, command=lambda col=c: self._sort_tree(self.tree_tx, col, False))
-            anchor = 'w' if c in ["Date","Type","Ticker","Note"] else 'e'
-            width = 160 if c in ["Date","Note"] else 110
+            anchor = 'w' if c in ["Date", "Type", "Ticker", "Note", "Reference"] else 'e'
+            width = 180 if c in ["Date", "Note", "Reference"] else 110
             self.tree_tx.column(c, width=width, anchor=anchor, stretch=True)
+
         vsb = ttk.Scrollbar(tree_frame, orient=VERTICAL, command=self.tree_tx.yview)
         hsb = ttk.Scrollbar(tree_frame, orient=HORIZONTAL, command=self.tree_tx.xview)
         self.tree_tx.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
         self.tree_tx.grid(row=0, column=0, sticky='nsew')
         vsb.grid(row=0, column=1, sticky='ns')
         hsb.grid(row=1, column=0, sticky='ew')
+
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
+
+        # Tags (unchanged)
         self.tree_tx.tag_configure('even', background='#222233')
         self.tree_tx.tag_configure('odd', background='#1a1a2a')
         self.tree_tx.tag_configure('buy', foreground='#66BB6A')
         self.tree_tx.tag_configure('sell', foreground='#EF5350')
         self.tree_tx.tag_configure('dividend', foreground='#FFCA28')
         self.tree_tx.tag_configure('total', font=('Segoe UI', 10, 'bold'), foreground='#BB86FC')
+
         self.render_transactions()
 
     def render_transactions(self):
@@ -1394,7 +1561,6 @@ class Trading212App:
         canvas = FigureCanvasTkAgg(fig, master=frame)
         canvas.get_tk_widget().pack(fill=BOTH, expand=True, padx=5, pady=5)
 
-        # Important: keep track of the cursor so we can remove it later
         cursor = None
 
         def cleanup_cursor():
@@ -1519,11 +1685,8 @@ class Trading212App:
                 for v, btn in period_btns.items():
                     btn.configure(bootstyle="primary" if v == period else "secondary")
             render()
-
-        # Initial render
         set_p("1d")
 
-        # Clean up when window is closed
         def on_close():
             cleanup_cursor()
             win.destroy()
@@ -1631,7 +1794,7 @@ class Trading212App:
             if not item:
                 return
             col = self.tree_watch.identify_column(event.x)
-            if col == '#1':  # Active column
+            if col == '#1':
                 values = self.tree_watch.item(item, 'values')
                 ticker = values[1]
                 for w in self.watchlist:
@@ -1915,29 +2078,21 @@ class Trading212App:
     # ────────────────────────────────────────────────
 
     def update_watchlist_prices(self):
-        #print(f"[DEBUG] Starting watchlist price update – {len(self.watchlist)} items")
-
         if not YFINANCE_AVAILABLE:
-            #print("[DEBUG] yfinance not available – skipping")
             return
 
         if not self.watchlist:
-            #print("[DEBUG] Watchlist empty – nothing to do")
             return
 
         for w in self.watchlist:
             sym = w.get('yf_symbol')
             ticker = w['ticker']
             if not sym:
-                #print(f"[SKIP] No yf_symbol for {ticker}")
                 continue
 
             price = get_current_price_yf(sym)
             if price is None or price <= 0:
-                #print(f"[SKIP] No valid price for {sym}")
                 continue
-
-            #print(f"[PRICE] {ticker} ({sym}): £{price:.4f}")
 
             w['current_price'] = round(price, 6)
             w['last_check'] = time.time()
@@ -1954,9 +2109,6 @@ class Trading212App:
 
             threshold = w.get('alert_drop_pct', 5.0)
 
-            #print(f"[CHECK] {ticker}: drop {drop_pct:.2f}%  vs threshold {threshold:.1f}%  (active={w.get('active', True)})")
-
-            # FIXED CONDITION: trigger when price DROPS by at least threshold %
             if drop_pct <= -threshold and w.get('active', True):
                 now_iso = datetime.now().isoformat()
                 notif = {
@@ -1973,11 +2125,9 @@ class Trading212App:
                 self.next_notification_id += 1
                 self.notifications.append(notif)
                 save_notifications(self.notifications)
-                #print(f"[ALERT TRIGGERED] Notification saved for {ticker} – drop {drop_pct:.1f}%")
 
         save_watchlist(self.watchlist)
         self._render_watchlist()
-        #print("[DEBUG] Watchlist update finished")
 
     # ────────────────────────────────────────────────
     # NOTES
@@ -2130,7 +2280,7 @@ class Trading212App:
         try:
             with open(NOTES_FILE, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-            messagebox.showinfo("Notes", "Notes saved successfully.")
+            #messagebox.showinfo("Notes", "Notes saved successfully.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save notes:\n{str(e)}")
 
@@ -2196,6 +2346,8 @@ class Trading212App:
         ttk.Button(btn_frame, text="Clear Transactions", bootstyle="danger", command=self.clear_transactions).pack(side=LEFT, padx=8)
         ttk.Button(btn_frame, text="Fetch & Import History CSV", bootstyle="info",
                    command=self.fetch_and_import_history).pack(side=LEFT, padx=8)
+        ttk.Button(btn_frame, text="Create Backup Now", bootstyle="info",
+                   command=create_hourly_backup).pack(side=LEFT, padx=8)
 
     def save_credentials(self):
         creds = ApiCredentials(self.api_key_var.get().strip(), self.api_secret_var.get().strip())
@@ -2262,7 +2414,7 @@ class Trading212App:
                                 status_var.set("Downloading CSV...")
                                 progress_win.update()
                                 csv_bytes = self.service.download_export_csv(dl_link)
-                                temp_path = os.path.join(DATA_DIR, f"temp_recent_export_{int(time.time())}.csv")
+                                temp_path = os.path.join(CSV_IMPORTS_DIR, f"trading212_export_{int(time.time())}.csv")
                                 with open(temp_path, "wb") as f:
                                     f.write(csv_bytes)
                                 status_var.set("Importing recent transactions...")
@@ -2295,41 +2447,131 @@ class Trading212App:
         try:
             encodings = ['utf-8', 'utf-8-sig', 'latin-1', 'iso-8859-1']
             df_new = None
+            
             for enc in encodings:
                 try:
                     raw = pd.read_csv(path, encoding=enc, on_bad_lines='skip')
                     if not raw.empty:
                         df_new = raw
-                        print(f"DEBUG: Read CSV with encoding: {enc}")
+                        print(f"DEBUG: Successfully read CSV with encoding: {enc}")
                         break
-                except:
+                except Exception as e:
+                    print(f"DEBUG: Encoding {enc} failed: {e}")
                     continue
+
             if df_new is None:
                 with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content_preview = f.read(500)
-                raise ValueError(f"Cannot parse CSV.\nFile preview:\n{content_preview}")
+                    preview = f.read(500)
+                raise ValueError(f"Cannot parse CSV file.\nPreview:\n{preview}")
+
+            # Normalize column names
             df_new.columns = df_new.columns.str.strip().str.lower()
-            print("DEBUG: Columns in downloaded CSV:", list(df_new.columns))
-            mapping = {
-                'time': 'Date', 'date': 'Date',
-                'action': 'Type', 'type': 'Type',
-                'ticker': 'Ticker', 'symbol': 'Ticker',
-                'no. of shares': 'Quantity', 'quantity': 'Quantity',
-                'price / share': 'Price', 'price': 'Price',
-                'total': 'Total', 'amount': 'Total',
-                'result': 'Result', 'p/l': 'Result',
-                'exchange rate': 'FX_Rate', 'fx rate': 'FX_Rate',
-                'currency': 'Currency',
-                'notes': 'Note', 'note': 'Note',
-                'id': 'Reference'
-            }
-            processed = pd.DataFrame()
-            for old, new in mapping.items():
-                matches = [c for c in df_new.columns if old.lower() in c.lower()]
-                if matches:
-                    processed[new] = df_new[matches[0]]
-            fee_cols = [c for c in df_new.columns if any(word in c.lower() for word in ['fee', 'tax', 'stamp', 'commission'])]
-            processed['Fee'] = df_new[fee_cols].sum(axis=1, numeric_only=True).fillna(0) if fee_cols else 0.0
+            print("DEBUG: Raw columns after normalization:", list(df_new.columns))
+
+            # ────────────────────────────────────────────────
+            # Explicit column renaming
+            # ────────────────────────────────────────────────
+            rename_map = {}
+
+            # Date / Time
+            if 'time' in df_new.columns:
+                rename_map['time'] = 'Date'
+            elif 'date' in df_new.columns:
+                rename_map['date'] = 'Date'
+
+            # Type / Action
+            if 'action' in df_new.columns:
+                rename_map['action'] = 'Type'
+            elif 'type' in df_new.columns:
+                rename_map['type'] = 'Type'
+
+            # Ticker
+            if 'ticker' in df_new.columns:
+                rename_map['ticker'] = 'Ticker'
+            elif 'symbol' in df_new.columns:
+                rename_map['symbol'] = 'Ticker'
+
+            # Quantity
+            if 'no. of shares' in df_new.columns:
+                rename_map['no. of shares'] = 'Quantity'
+            elif 'quantity' in df_new.columns:
+                rename_map['quantity'] = 'Quantity'
+
+            # Price
+            if 'price / share' in df_new.columns:
+                rename_map['price / share'] = 'Price'
+            elif 'price' in df_new.columns:
+                rename_map['price'] = 'Price'
+
+            # Total
+            if 'total' in df_new.columns:
+                rename_map['total'] = 'Total'
+            elif 'amount' in df_new.columns:
+                rename_map['amount'] = 'Total'
+
+            # Result
+            if 'result' in df_new.columns:
+                rename_map['result'] = 'Result'
+            elif 'p/l' in df_new.columns:
+                rename_map['p/l'] = 'Result'
+
+            # FX Rate
+            if 'exchange rate' in df_new.columns:
+                rename_map['exchange rate'] = 'FX_Rate'
+            elif 'fx rate' in df_new.columns:
+                rename_map['fx rate'] = 'FX_Rate'
+
+            # Currency
+            if 'currency' in df_new.columns:
+                rename_map['currency'] = 'Currency'
+
+            # Note
+            if 'notes' in df_new.columns:
+                rename_map['notes'] = 'Note'
+            elif 'note' in df_new.columns:
+                rename_map['note'] = 'Note'
+
+            # ── Reference / ID ───────────────────────────────────────
+            id_candidates = [c for c in df_new.columns if 'id' in c.lower() or c.upper() == 'ID']
+            if id_candidates:
+                rename_map[id_candidates[0]] = 'Reference'
+                print(f"DEBUG: Found and mapped ID column: '{id_candidates[0]}' → 'Reference'")
+            else:
+                print("DEBUG: No 'id' or 'ID' column found in CSV")
+
+            # Apply renames
+            if rename_map:
+                df_new = df_new.rename(columns=rename_map)
+                print(f"DEBUG: Applied renames: {rename_map}")
+
+            # Create processed DataFrame
+            desired_cols = ['Date', 'Type', 'Ticker', 'Quantity', 'Price', 'Total',
+                            'Fee', 'Result', 'FX_Rate', 'Currency', 'Note', 'Reference']
+            existing_cols = [c for c in desired_cols if c in df_new.columns]
+            processed = df_new[existing_cols].copy()
+
+            # Guarantee Reference column exists
+            if 'Reference' not in processed.columns:
+                processed['Reference'] = pd.NA
+                print("DEBUG: Created empty 'Reference' column (was missing)")
+
+            # ── Fill missing References from Note (for deposits) ─────
+            if 'Note' in processed.columns and 'Reference' in processed.columns:
+                mask = processed['Reference'].isna() | (processed['Reference'].astype(str).str.strip() == '')
+                extracted = processed.loc[mask, 'Note'].str.extract(r'Transaction ID: (\w+)', expand=False)
+                processed.loc[mask, 'Reference'] = extracted.combine_first(processed.loc[mask, 'Reference'])
+                print(f"DEBUG: Filled {mask.sum()} missing References from Note column")
+
+            # ── Fees ─────────────────────────────────────────────────
+            fee_keywords = ['fee', 'tax', 'stamp', 'commission', 'stamp duty', 'sdrt']
+            fee_cols = [c for c in df_new.columns if any(kw in c.lower() for kw in fee_keywords)]
+            if fee_cols:
+                processed['Fee'] = df_new[fee_cols].sum(axis=1, numeric_only=True).fillna(0)
+                print(f"DEBUG: Fee columns used: {fee_cols}")
+            else:
+                processed['Fee'] = 0.0
+
+            # ── Type normalization ───────────────────────────────────
             if 'Type' in processed.columns:
                 processed['Type'] = processed['Type'].astype(str).str.lower().replace({
                     r'(?i)buy|market buy': 'Buy',
@@ -2338,28 +2580,46 @@ class Trading212App:
                     r'(?i)withdrawal': 'Withdrawal',
                     r'(?i)dividend': 'Dividend'
                 }, regex=True)
-            processed['Date'] = pd.to_datetime(processed.get('Date'), errors='coerce')
-            for col in ['Quantity', 'Price', 'Total', 'Fee', 'Result', 'FX_Rate']:
+
+            # ── Date & numeric columns ───────────────────────────────
+            if 'Date' in processed.columns:
+                processed['Date'] = pd.to_datetime(processed['Date'], errors='coerce')
+
+            numeric_cols = ['Quantity', 'Price', 'Total', 'Fee', 'Result', 'FX_Rate']
+            for col in numeric_cols:
                 if col in processed.columns:
                     processed[col] = pd.to_numeric(processed[col], errors='coerce').fillna(0)
+
+            # ── Deduplication ────────────────────────────────────────
             dedup_cols = ['Date', 'Type', 'Ticker', 'Total', 'Reference']
             dedup_cols = [c for c in dedup_cols if c in processed.columns]
+
             existing = self.df.copy()
             if 'Date' in existing.columns:
                 existing['Date'] = pd.to_datetime(existing['Date'], errors='coerce')
+
             if not existing.empty and dedup_cols:
-                merged = pd.merge(processed, existing[dedup_cols], how='left', on=dedup_cols, indicator=True)
+                merged = pd.merge(
+                    processed, existing[dedup_cols],
+                    how='left', on=dedup_cols, indicator=True
+                )
                 new_rows = merged[merged['_merge'] == 'left_only'].drop(columns='_merge')
             else:
                 new_rows = processed.copy()
+
             if new_rows.empty:
                 print("DEBUG: No new rows after deduplication")
                 return
+
             self.df = pd.concat([self.df, new_rows], ignore_index=True)
-            self.df = self.repo.deduplicate(self.df.fillna({'Ticker':'-', 'Note':''}))
+            self.df = self.repo.deduplicate(
+                self.df.fillna({'Ticker': '-', 'Note': '', 'Reference': ''})
+            )
             self.df = self.df.sort_values('Date', ascending=False).reset_index(drop=True)
             self.repo.save(self.df)
-            print(f"DEBUG: Added {len(new_rows)} new rows from recent history")
+
+            print(f"DEBUG: Successfully imported and added {len(new_rows)} new rows")
+
         except Exception as e:
             print(f"ERROR during import: {str(e)}")
             raise
