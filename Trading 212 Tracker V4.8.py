@@ -1,3 +1,6 @@
+# Trading212 Portfolio Pro — v4.8 (Notifications fixed – alerts fire every time threshold is met)
+# Complete file with all methods included, migrated to SQLite for most JSON files
+
 import os
 import json
 import time
@@ -635,6 +638,22 @@ class Trading212App:
         self.notifications = load_notifications()
         self.next_notification_id = max((n['id'] for n in self.notifications), default=0) + 1
 
+        # ── CREATE THE VARIABLE FIRST ────────────────────────────────
+        self.auto_refresh_enabled = tk.BooleanVar(value=True)  # default ON
+
+        # ── THEN load the saved value (if exists) ────────────────────
+        with get_db_connection() as conn:
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = 'auto_refresh_enabled'"
+            ).fetchone()
+            if row:
+                val = row['value'].lower()
+                if val in ('true', '1', 'yes', 'on'):
+                    self.auto_refresh_enabled.set(True)
+                elif val in ('false', '0', 'no', 'off'):
+                    self.auto_refresh_enabled.set(False)
+                # else → keep default True
+        
         self.netgain_cursor = None
         self.price_history_cursor = None
 
@@ -644,10 +663,17 @@ class Trading212App:
         self.refresh(async_fetch=True)
         self.update_countdown()
         self.root.bind_all("<Control-s>", lambda event: self.save_notes() if hasattr(self, 'notes_text') else None)
-        def auto_refresh_loop():
-            self.refresh(async_fetch=True)
-            self.root.after(AUTO_REFRESH_INTERVAL_SEC * 1000, auto_refresh_loop)
-        self.root.after(10000, auto_refresh_loop)
+
+        def schedule_next_auto_refresh():
+            if self.auto_refresh_enabled.get():
+                self.refresh(async_fetch=True)
+                self.root.after(AUTO_REFRESH_INTERVAL_SEC * 1000, schedule_next_auto_refresh)
+            else:
+                self.countdown_var.set("Suspended auto-refresh")
+                self.countdown_label.configure(foreground='orange')
+
+        # Start it (still in __init__)
+        self.root.after(10000, schedule_next_auto_refresh)
         def watchlist_auto_refresh():
             self.update_watchlist_prices()
             self.root.after(60000, watchlist_auto_refresh)
@@ -741,25 +767,33 @@ class Trading212App:
                                          foreground='yellow', font=('Segoe UI', 10, 'bold'))
         self.countdown_label.pack(pady=(0,10), padx=10, anchor='s')
     def update_countdown(self):
+        if not self.auto_refresh_enabled.get():
+            self.countdown_var.set("Auto-refresh Suspended")
+            self.countdown_label.configure(foreground='orange')
+            self.root.after(2000, self.update_countdown)  # keep checking
+            return
+
         now = time.time()
         if self.next_auto_refresh_time > now:
             remaining = max(0, int(self.next_auto_refresh_time - now))
             minutes = remaining // 60
             seconds = remaining % 60
-            if minutes > 0:
-                text = f"Next refresh in {minutes}m {seconds:02d}s"
-            else:
-                text = f"Next refresh in {seconds}s"
-                if seconds <= 10:
-                    self.countdown_label.configure(foreground='red')
-                else:
-                    self.countdown_label.configure(foreground='yellow')
+            text = f"Next refresh in {minutes}m {seconds:02d}s" if minutes > 0 else f"Next refresh in {seconds}s"
+            color = 'orange' if seconds <= 10 else 'yellow'
             self.countdown_var.set(text)
+            self.countdown_label.configure(foreground=color)
             self.root.after(1000, self.update_countdown)
         else:
             self.countdown_var.set("Refreshing now...")
             self.countdown_label.configure(foreground='lime')
             self.root.after(2000, lambda: self.countdown_label.configure(foreground='yellow'))
+
+    def _start_full_countdown_after_enable(self):
+        """Called after brief 'Enabling...' message — starts full 60s countdown"""
+        self.next_auto_refresh_time = time.time() + AUTO_REFRESH_INTERVAL_SEC
+        self.countdown_label.configure(foreground='yellow')
+        self.update_countdown()  # immediately show "Next refresh in 60s..."
+
     def _set_total_return_text(self, text: str):
         if "Total Return" in self.card_vars:
             self.card_vars["Total Return"].set(text)
@@ -981,7 +1015,10 @@ class Trading212App:
             else:          card.configure(bootstyle="danger")
 
         self.card_vars["TTM Dividends"].set(f"£{round_money(s['ttm_dividends']):,.2f}")
-        self.card_vars["Realised P/L"].set(f"£{round_money(s['realised_pl']):+,.2f}")
+
+        #Old fees added so changed 
+        #self.card_vars["Realised P/L"].set(f"£{round_money(s['realised_pl']):+,.2f}")
+        self.card_vars["Realised P/L"].set(f"£{round_money(s['realised_pl'] - s['fees']):+,.2f}")
         self.card_vars["Fees Paid"].set(f"£{round_money(s['fees']):,.2f}")
 
         # ── Sidebar Stats ────────────────────────────────────────────────────────────
@@ -1031,107 +1068,124 @@ class Trading212App:
         show_count = min(MAX_BAR_TICKERS, len(sorted_active))
 
         # ── Panel 1: Top Positions by Value ──────────────────────────────────────────
-        tickers = [p.ticker for p in sorted_active[:show_count]]
-        values = [p.est_value for p in sorted_active[:show_count]]
-        colors = ['#2E7D32' if p.unrealised_pl >= 0 else '#C62828' for p in sorted_active[:show_count]]
+        sorted_active = sorted(active, key=lambda x: -x.est_value)  # already have this earlier
+        show_count = min(MAX_BAR_TICKERS, len(sorted_active))
 
-        bars = self.ax1.bar(tickers, values, color=colors, edgecolor='#424242', linewidth=0.5, zorder=3)
-        self.ax1.tick_params(axis='x', rotation=50, labelsize=9.5, colors='#B0BEC5')
-        self.ax1.set_title("Top Positions by Value", fontsize=13, pad=12, color='white', fontweight='normal')
+        top_positions = sorted_active[:show_count]
+        tickers = [p.ticker for p in top_positions]
+        values = [p.est_value for p in top_positions]
 
-        for bar, pos in zip(bars, sorted_active[:show_count]):
-            height = bar.get_height()
-            ret_pct = (pos.unrealised_pl / pos.total_cost * 100) if pos.total_cost > 0 else 0.0
+        # Softer colors based on unrealised P/L (same as before)
+        colors = ['#66BB6A' if p.unrealised_pl >= 0 else '#EF5350' for p in top_positions]
 
-            pct_color = '#2E7D32' if ret_pct >= 0 else '#C62828'
-            pct_str = f"{ret_pct:+.1f}%"
+        # ── Horizontal bars like Winners / Losers ────────────────────────────────
+        bars = self.ax1.barh(tickers[::-1], values[::-1], color=colors[::-1], height=0.68, zorder=3)
 
-            y_pos = height + height * 0.035
+        self.ax1.set_title("Top Positions by Value", fontsize=14, pad=15, color='white', fontweight='medium')
+        self.ax1.invert_yaxis()  # highest on top
+        self.ax1.tick_params(colors='#CCCCCC', labelsize=10)
 
+        # Set reasonable x-limit (positive values only)
+        max_val = max(values) if values else 1
+        self.ax1.set_xlim(0, max_val * 1.25)
+
+        # Add £ value labels to the right of each bar (no percentage)
+        for bar, val in zip(bars, values[::-1]):
+            label = f"£{round_money(val):,.0f}" if val >= 1000 else f"£{round_money(val):,.1f}"
             self.ax1.text(
-                bar.get_x() + bar.get_width() / 2,
-                y_pos,
-                pct_str,
-                ha='center', va='bottom',
-                fontsize=9.5,
-                fontweight='semibold',
-                color=pct_color,
-                zorder=12,
-                path_effects=[
-                    path_effects.withStroke(linewidth=2.5, foreground='#000000'),
-                    path_effects.Normal()
-                ]
+                val + max_val * 0.025,          # small offset to the right
+                bar.get_y() + bar.get_height()/2,
+                label,
+                va='center', ha='left',
+                fontsize=10,
+                color='#FFFFFF',
+                fontweight='medium',
+                path_effects=[path_effects.withStroke(linewidth=2.2, foreground='#000000')]
             )
-
         # ── Panel 2: Portfolio Allocation (%) ────────────────────────────────────────
         alloc_sorted = sorted(active, key=lambda x: -x.portfolio_pct)[:12]
         alloc_labels = [p.ticker for p in alloc_sorted]
         alloc_sizes = [p.portfolio_pct for p in alloc_sorted]
-        alloc_colors = plt.cm.Greys(np.linspace(0.4, 0.9, len(alloc_labels)))  # professional grayscale
 
-        self.ax2.barh(alloc_labels[::-1], alloc_sizes[::-1], color=alloc_colors, height=0.65, zorder=3)
-        self.ax2.set_title("Portfolio Allocation (%)", fontsize=13, pad=12, color='white', fontweight='normal')
+        # Use softer, more modern gradient (blues instead of pure gray)
+        alloc_colors = plt.cm.Blues(np.linspace(0.35, 0.85, len(alloc_labels)))
+
+        bars = self.ax2.barh(alloc_labels[::-1], alloc_sizes[::-1], color=alloc_colors, height=0.68, zorder=3)
+        self.ax2.set_title("Portfolio Allocation (%)", fontsize=14, pad=15, color='white', fontweight='medium')
         self.ax2.invert_yaxis()
-        self.ax2.set_xlim(0, max(alloc_sizes + [1]) * 1.15)
-        self.ax2.tick_params(colors='#B0BEC5', labelsize=9.5)
-        for i, val in enumerate(alloc_sizes[::-1]):
-            self.ax2.text(val + 0.6, i, f"{val:.1f}%", va='center', fontsize=9.5, color='#E0E0E0', fontweight='medium')
+        self.ax2.set_xlim(0, max(alloc_sizes + [1]) * 1.18)
+        self.ax2.tick_params(colors='#CCCCCC', labelsize=10)
+
+        # Add % labels inside bars (cleaner look)
+        for bar, size in zip(bars, alloc_sizes[::-1]):
+            width = bar.get_width()
+            self.ax2.text(
+                width + 0.4,                    # slight offset from bar end
+                bar.get_y() + bar.get_height()/2,
+                f"{size:.1f}%",
+                va='center', ha='left',
+                fontsize=9.5, color='#FFFFFF',
+                fontweight='medium',
+                path_effects=[path_effects.withStroke(linewidth=1.8, foreground='#000000')]
+            )
 
         # ── Panel 3: Top Winners (£) ─────────────────────────────────────────────────
         winners = sorted([p for p in active if p.unrealised_pl > 0], key=lambda x: -x.unrealised_pl)[:5]
         if winners:
             win_tickers = [p.ticker for p in winners]
             win_pl = [p.unrealised_pl for p in winners]
-            self.ax3.barh(win_tickers[::-1], win_pl[::-1], color='#2E7D32', height=0.65, zorder=3)
-            self.ax3.set_title("Top Winners (£)", fontsize=13, pad=12, color='white', fontweight='normal')
+            
+            # Softer positive green
+            self.ax3.barh(win_tickers[::-1], win_pl[::-1], color='#4CAF50', height=0.68, zorder=3)
+            self.ax3.set_title("Top Winners (£)", fontsize=14, pad=15, color='white', fontweight='medium')
             self.ax3.invert_yaxis()
             max_win = max(win_pl, default=1)
+            self.ax3.set_xlim(0, max_win * 1.25)
+            
             for i, v in enumerate(win_pl[::-1]):
-                label = self.format_exact_pnl(v)
+                label = self.format_exact_pnl(v)   # already has £
                 self.ax3.text(
-                    v + max_win * 0.035,
+                    v + max_win * 0.025,
                     i,
                     label,
-                    va='center',
-                    fontsize=9.5,
-                    color='#E0E0E0',
+                    va='center', ha='left',
+                    fontsize=10,
+                    color='#FFFFFF',
                     fontweight='medium',
-                    path_effects=[
-                        path_effects.withStroke(linewidth=2.8, foreground='#000000'),
-                        path_effects.Normal()
-                    ]
+                    path_effects=[path_effects.withStroke(linewidth=2.2, foreground='#000000')]
                 )
         else:
-            self.ax3.text(0.5, 0.5, "No winners yet", ha='center', va='center', color='#757575', fontsize=11)
-            self.ax3.set_title("Top Winners", fontsize=13, pad=12, color='white')
+            self.ax3.text(0.5, 0.5, "No winners yet", ha='center', va='center', color='#888888', fontsize=12)
+            self.ax3.set_title("Top Winners (£)", fontsize=14, pad=15, color='white')
 
         # ── Panel 4: Top Losers (£) ──────────────────────────────────────────────────
         losers = sorted([p for p in active if p.unrealised_pl < 0], key=lambda x: x.unrealised_pl)[:5]
         if losers:
             lose_tickers = [p.ticker for p in losers]
             lose_pl = [p.unrealised_pl for p in losers]
-            self.ax4.barh(lose_tickers[::-1], lose_pl[::-1], color='#C62828', height=0.65, zorder=3)
-            self.ax4.set_title("Top Losers (£)", fontsize=13, pad=12, color='white', fontweight='normal')
+            
+            # Softer negative red
+            self.ax4.barh(lose_tickers[::-1], lose_pl[::-1], color='#E57373', height=0.68, zorder=3)
+            self.ax4.set_title("Top Losers (£)", fontsize=14, pad=15, color='white', fontweight='medium')
             self.ax4.invert_yaxis()
             max_lose = abs(min(lose_pl, default=-1))
+            self.ax4.set_xlim(min(lose_pl) * 1.25, 0)  # negative side
+            
             for i, v in enumerate(lose_pl[::-1]):
-                label = self.format_exact_pnl(v)
+                label = self.format_exact_pnl(v)   # already has £
                 self.ax4.text(
-                    v - max_lose * 0.035,
+                    v - max_lose * 0.025,
                     i,
                     label,
-                    va='center',
-                    fontsize=9.5,
-                    color='#E0E0E0',
+                    va='center', ha='right',
+                    fontsize=10,
+                    color='#FFFFFF',
                     fontweight='medium',
-                    path_effects=[
-                        path_effects.withStroke(linewidth=2.8, foreground='#000000'),
-                        path_effects.Normal()
-                    ]
+                    path_effects=[path_effects.withStroke(linewidth=2.2, foreground='#000000')]
                 )
         else:
-            self.ax4.text(0.5, 0.5, "No losers yet", ha='center', va='center', color='#757575', fontsize=11)
-            self.ax4.set_title("Top Losers", fontsize=13, pad=12, color='white')
+            self.ax4.text(0.5, 0.5, "No losers yet", ha='center', va='center', color='#888888', fontsize=12)
+            self.ax4.set_title("Top Losers (£)", fontsize=14, pad=15, color='white')
 
         self.canvas.draw()
     # ────────────────────────────────────────────────
@@ -1476,23 +1530,25 @@ class Trading212App:
                 ax.text(0.5, 0.5, "No price history yet", ha='center', va='center', color='gray', fontsize=12)
                 canvas.draw()
                 return
-
             ts_list = [datetime.fromtimestamp(d['ts']) for d in hist]
             prices = [d['price'] for d in hist]
-
             cutoff = get_cutoff(period_var.get())
             if cutoff is not None:
                 mask = [t >= cutoff for t in ts_list]
                 ts_list = [t for t, keep in zip(ts_list, mask) if keep]
                 prices = [p for p, keep in zip(prices, mask) if keep]
-
+            
+            # NEW: Filter out weekends (keep only Mon-Fri, weekday 0-4)
+            mask = [t.weekday() < 5 for t in ts_list]
+            ts_list = [t for t, keep in zip(ts_list, mask) if keep]
+            prices = [p for p, keep in zip(prices, mask) if keep]
+            
             if not ts_list:
                 ax.clear()
                 ax.text(0.5, 0.5, f"No data in selected period ({period_var.get()})",
                         ha='center', va='center', color='gray', fontsize=12)
                 canvas.draw()
                 return
-
             ax.clear()
             ax.set_facecolor('#252535')
             ax.tick_params(colors='white')
@@ -1501,11 +1557,9 @@ class Trading212App:
                 ax.spines[spine].set_visible(False)
             ax.spines['left'].set_color('gray')
             ax.spines['bottom'].set_color('gray')
-
             ax.set_title(f"{ticker} Price History (£)", color='white', fontsize=14, pad=15)
             ax.set_xlabel("Date", color='white')
             ax.set_ylabel("Price (£)", color='white')
-
             line, = ax.plot(
                 ts_list, prices,
                 color='#BB86FC',
@@ -1514,7 +1568,6 @@ class Trading212App:
                 markersize=3,
                 alpha=0.9
             )
-
             if prices:
                 min_p = min(prices)
                 max_p = max(prices)
@@ -1527,20 +1580,16 @@ class Trading212App:
                            label=f"Max: £{max_p:,.2f}")
                 ax.legend(loc='upper left', frameon=True,
                           facecolor='#252535', edgecolor='gray', labelcolor='white')
-
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b %Y'))
             ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=12))
             plt.setp(ax.get_xticklabels(), rotation=35, ha='right')
-
             ax.yaxis.set_major_formatter(
                 plt.FuncFormatter(lambda y, _: f'£{y:,.2f}' if abs(y) < 100 else f'£{int(y):,}')
             )
-
             # ── FIXED: Remove old cursor before creating new one ──
             if self.price_history_cursor is not None:
                 self.price_history_cursor.remove()
                 self.price_history_cursor = None
-
             if MPLCURSORS_AVAILABLE and ts_list and prices:
                 self.price_history_cursor = mplcursors.cursor(line, hover=True, highlight=True)
                 @self.price_history_cursor.connect("add")
@@ -1553,7 +1602,6 @@ class Trading212App:
                     sel.annotation.get_bbox_patch().set_edgecolor("#bb86fc")
                     sel.annotation.set_color("white")
                     sel.annotation.xy = sel.target
-
             fig.tight_layout()
             canvas.draw()
 
@@ -2178,7 +2226,7 @@ class Trading212App:
         try:
             with open(NOTES_FILE, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-            messagebox.showinfo("Notes", "Notes saved successfully.")
+            #messagebox.showinfo("Notes", "Notes saved successfully.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save notes:\n{str(e)}")
     def load_notes(self, silent=False):
@@ -2226,21 +2274,101 @@ class Trading212App:
     # SETTINGS
     # ────────────────────────────────────────────────
     def _build_settings(self):
-        f = ttk.Frame(self.tab_settings, padding=30)
-        f.pack(fill=BOTH, expand=True)
-        ttk.Label(f, text="API Key").grid(row=0, column=0, sticky='e', pady=8, padx=10)
+        # Main container with generous padding
+        f = ttk.Frame(self.tab_settings, padding=40)           # increased padding → feels more spacious
+        f.pack(fill=tk.BOTH, expand=True)
+
+        # ── Credentials Section ───────────────────────────────────────
+        ttk.Label(f, text="API Key", font="-size 11").grid(
+            row=0, column=0, sticky='e', pady=(12, 6), padx=(0, 12))
         self.api_key_var = tk.StringVar(value=self.creds.key)
-        ttk.Entry(f, textvariable=self.api_key_var, width=55).grid(row=0, column=1, pady=8)
-        ttk.Label(f, text="API Secret").grid(row=1, column=0, sticky='e', pady=8, padx=10)
+        ttk.Entry(f, textvariable=self.api_key_var, width=60).grid(
+            row=0, column=1, pady=(12, 6), sticky='ew')
+
+        ttk.Label(f, text="API Secret", font="-size 11").grid(
+            row=1, column=0, sticky='e', pady=(6, 12), padx=(0, 12))
         self.api_secret_var = tk.StringVar(value=self.creds.secret)
-        ttk.Entry(f, textvariable=self.api_secret_var, width=55, show="*").grid(row=1, column=1, pady=8)
+        ttk.Entry(f, textvariable=self.api_secret_var, width=60, show="*").grid(
+            row=1, column=1, pady=(6, 12), sticky='ew')
+
+        # Action buttons – right-aligned
         btn_frame = ttk.Frame(f)
-        btn_frame.grid(row=2, column=1, pady=20, sticky='e')
-        ttk.Button(btn_frame, text="Save Credentials", bootstyle="success", command=self.save_credentials).pack(side=LEFT, padx=8)
-        ttk.Button(btn_frame, text="Clear Cache", bootstyle="warning", command=self.clear_cache).pack(side=LEFT, padx=8)
-        ttk.Button(btn_frame, text="Clear Transactions", bootstyle="danger", command=self.clear_transactions).pack(side=LEFT, padx=8)
-        ttk.Button(btn_frame, text="Fetch & Import History CSV", bootstyle="info",
-                   command=self.fetch_and_import_history).pack(side=LEFT, padx=8)
+        btn_frame.grid(row=2, column=0, columnspan=2, pady=24, sticky='e')
+
+        ttk.Button(btn_frame, text="Save Credentials", bootstyle="success-outline",
+                   command=self.save_credentials).pack(side='left', padx=6)
+        ttk.Button(btn_frame, text="Clear Cache", bootstyle="warning-outline",
+                   command=self.clear_cache).pack(side='left', padx=6)
+        ttk.Button(btn_frame, text="Clear Transactions", bootstyle="danger-outline",
+                   command=self.clear_transactions).pack(side='left', padx=6)
+        ttk.Button(btn_frame, text="Fetch & Import History CSV", bootstyle="info-outline",
+                   command=self.fetch_and_import_history).pack(side='left', padx=6)
+
+        # ── Separator ──────────────────────────────────────────────────
+        ttk.Separator(f, orient='horizontal').grid(
+            row=3, column=0, columnspan=2, sticky='ew', pady=30)
+
+        # ── Auto-refresh Section ───────────────────────────────────────
+        ttk.Label(f, text="Auto-refresh", font="-size 12 -weight bold").grid(
+            row=4, column=0, sticky='ne', padx=(0, 12), pady=(8, 0))
+
+        toggle_frame = ttk.Frame(f)
+        toggle_frame.grid(row=4, column=1, sticky='w', pady=(8, 0))
+
+        # Modern round toggle switch – green when enabled looks great
+        self.auto_refresh_chk = ttk.Checkbutton(
+            toggle_frame,
+            text="Refresh portfolio & watchlist prices every 60 seconds",
+            variable=self.auto_refresh_enabled,
+            command=self.on_auto_refresh_toggled,
+            bootstyle="success round-toggle"   # ← the magic line
+        )
+        self.auto_refresh_chk.pack(side='left')
+
+        # Optional: small status label (very common in modern apps)
+        status_label = ttk.Label(toggle_frame, text="", bootstyle="secondary")
+        status_label.pack(side='left', padx=20)
+
+        def update_status(*args):
+            status_label.config(
+                text="Active" if self.auto_refresh_enabled.get() else "Paused",
+                bootstyle="success" if self.auto_refresh_enabled.get() else "warning"
+            )
+
+        self.auto_refresh_enabled.trace_add('write', update_status)
+        update_status()  # initial state
+
+        # Make column 1 expand horizontally
+        f.columnconfigure(1, weight=1)
+
+    def on_auto_refresh_toggled(self):
+        self.save_auto_refresh_setting()
+        
+        if self.auto_refresh_enabled.get():
+            # Show brief "Enabling..." message
+            self.countdown_var.set("Enabling auto-refresh...")
+            self.countdown_label.configure(foreground='lime')
+            self.root.update()  # force UI update so user sees it immediately
+            
+            # Tiny delay so the message is visible for ~0.5–1 second
+            self.root.after(600, lambda: self._start_full_countdown_after_enable())
+            
+            #messagebox.showinfo("Auto-refresh", "Auto-refresh enabled.\nNext refresh will start in ~60 seconds.")
+        else:
+            self.countdown_var.set("Suspending Auto-refresh..")
+            self.countdown_label.configure(foreground='orange')
+            #messagebox.showinfo("Auto-refresh", "Auto-refresh Suspended.")
+
+    # ── MOVED HERE ── now it's a proper class method
+    def save_auto_refresh_setting(self):
+        val = 'true' if self.auto_refresh_enabled.get() else 'false'
+        with get_db_connection() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('auto_refresh_enabled', ?)",
+                (val,)
+            )
+            conn.commit()
+
     def save_credentials(self):
         creds = ApiCredentials(self.api_key_var.get().strip(), self.api_secret_var.get().strip())
         Secrets.save(creds)
